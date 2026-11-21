@@ -60,14 +60,15 @@ jobs:
   # macOS Intel: scalar / SSE4.2
   # ---------------------------------------------------------------------------
   macos-intel:
-    name: macOS Intel / ${{ matrix.simd }}
-    runs-on: macos-15-intel
+    name: macOS Intel / SSE4.2
+    # macos-13 is the stable Intel image; macos-15-intel is not available
+    # on all plans. Scalar coverage is provided by the Linux jobs.
+    runs-on: macos-13
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { simd: scalar, cflags: "" }
-          - { simd: sse42,  cflags: "-msse4.2" }
+          - { simd: sse42, cflags: "-msse4.2" }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,14 +81,14 @@ jobs:
   # macOS Apple Silicon: NEON / scalar fallback
   # ---------------------------------------------------------------------------
   macos-arm64:
-    name: macOS ARM64 / ${{ matrix.simd }}
+    name: macOS ARM64 / NEON
+    # Scalar fallback is covered by the Linux ARM64 job to reduce macOS usage.
     runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { simd: neon,    cflags: "" }
-          - { simd: no-neon, cflags: "-DPICOHTTPPARSER_NO_NEON" }
+          - { simd: neon, cflags: "" }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -101,14 +102,13 @@ jobs:
   # test.c uses POSIX mmap/sysconf, so use a portable smoke test instead.
   # ---------------------------------------------------------------------------
   windows-msvc:
-    name: Windows MSVC / ${{ matrix.arch }}
+    name: Windows MSVC / x64
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   simd: "/arch:AVX", execute: true }
-          - { arch: ARM64, simd: "",          execute: false }
+          - { arch: x64, simd: "/arch:AVX", execute: true }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -210,6 +210,27 @@ jobs:
           ./smoke.exe
 
   # ---------------------------------------------------------------------------
+  # Windows ARM64: compile-only with MSYS2 CLANGARM64 (NEON path)
+  # The MSVC ARM64 matrix entry was removed because cl was not on PATH
+  # in the amd64_arm64 environment on windows-latest.
+  # ---------------------------------------------------------------------------
+  windows-arm64:
+    name: Windows ARM64 clang (NEON compile)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          install: mingw-w64-clang-aarch64-clang
+      - name: Compile library
+        shell: msys2 {0}
+        run: |
+          clang -std=c99 -Wall -Wextra -c picohttpparser.c -o pico-arm64.o
+
+  # ---------------------------------------------------------------------------
   # ARMv7: compile-only, verifies scalar fallback
   # ---------------------------------------------------------------------------
   armv7-cross:
@@ -275,12 +296,12 @@ jobs:
           PY
 
   # ---------------------------------------------------------------------------
-  # Bench: ARM64 scalar vs NEON
-  # NEON is newer, so use a loose regression guard and report the numbers.
+  # Bench: Linux ARM64 scalar vs NEON
+  # Moved here from macOS to avoid macOS runner quota/cancellation.
   # ---------------------------------------------------------------------------
-  bench-arm64:
-    name: Bench ARM64 (scalar vs NEON)
-    runs-on: macos-14
+  bench-linux-arm64:
+    name: Bench Linux ARM64 (scalar vs NEON)
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
         with:
