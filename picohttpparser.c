@@ -149,48 +149,80 @@ static const char *findchar_fast_sse42(const char *buf, const char *buf_end,
 #endif
 
 #ifdef PICOHTTPPARSER_USE_NEON
-static const char *findchar_fast_neon(const char *buf, const char *buf_end, 
+static inline int ctz64_nonzero(uint64_t x)
+{
+#if defined(_MSC_VER)
+    unsigned long idx;
+    _BitScanForward64(&idx, x);
+    return (int)idx;
+#else
+    return __builtin_ctzll(x);
+#endif
+}
+
+static inline int neon_first_match(const uint8x16_t mask)
+{
+    uint8_t m[16];
+    vst1q_u8(m, mask);
+    uint64_t w0, w1;
+    memcpy(&w0, m, 8);
+    memcpy(&w1, m + 8, 8);
+    if (w0)
+        return (int)(ctz64_nonzero(w0) >> 3);
+    if (w1)
+        return 8 + (int)(ctz64_nonzero(w1) >> 3);
+    return 16;
+}
+
+static const char *findchar_fast_neon(const char *buf, const char *buf_end,
                                        const char *ranges, size_t ranges_size, int *found)
 {
     *found = 0;
     if (buf_end - buf < 16)
         return buf;
 
-    /* ranges is a sequence of [lo, hi] pairs. pico callers only pass even
-     * lengths (4/6/16); the odd-length branch is defensive only and treats
-     * the last pair as a single-byte range. */
     size_t num_pairs = (ranges_size + 1) / 2;
+
+    uint8x16_t lo_v[8];
+    uint8x16_t width_v[8];
+    uint8_t    valid[8];
+    size_t     n = 0;
+    for (size_t i = 0; i < num_pairs && n < 8; i++) {
+        uint8_t lo = (uint8_t)ranges[i * 2];
+        uint8_t hi = (i * 2 + 1 < ranges_size) ? (uint8_t)ranges[i * 2 + 1] : lo;
+
+        valid[n]   = (lo <= hi);
+        lo_v[n]    = vdupq_n_u8(lo);
+        width_v[n] = vdupq_n_u8((uint8_t)(hi - lo));
+        n++;
+    }
 
     while (buf_end - buf >= 16) {
         uint8x16_t v = vld1q_u8((const uint8_t *)buf);
-        uint8x16_t mask = vdupq_n_u8(0);
 
-        for (size_t i = 0; i < num_pairs; i++) {
-            uint8_t lo = (uint8_t)ranges[i * 2];
-            /* With an odd ranges_size the last pair has no hi; match one byte. */
-            uint8_t hi = (i * 2 + 1 < ranges_size) ? (uint8_t)ranges[i * 2 + 1] : lo;
+        uint8x16_t mask;
+        size_t i = 0;
 
-            /* SSE4.2 _SIDD_CMP_RANGES: lo > hi is an empty range (matches nothing). */
-            if (lo > hi)
-                continue;
-
-            uint8x16_t ge_lo = vcgeq_u8(v, vdupq_n_u8(lo));
-            uint8x16_t le_hi = vcleq_u8(v, vdupq_n_u8(hi));
-            mask = vorrq_u8(mask, vandq_u8(ge_lo, le_hi));
+        while (i < n && !valid[i]) i++;
+        if (i < n) {
+            mask = vcleq_u8(vsubq_u8(v, lo_v[i]), width_v[i]);
+            i++;
+        } else {
+            buf += 16;
+            continue;
         }
 
-        /* Fast path: check whether any byte matched. */
-        if (vmaxvq_u8(mask) != 0) {
-            /* Scalar fallback: locate the first matching byte. */
-            uint8_t m[16];
-            vst1q_u8(m, mask);
-            for (int i = 0; i < 16; i++) {
-                if (m[i]) {
-                    buf += i;
-                    *found = 1;
-                    return buf;
-                }
-            }
+        for (; i < n; i++) {
+            if (!valid[i]) continue;
+            uint8x16_t d = vsubq_u8(v, lo_v[i]);
+            mask = vorrq_u8(mask, vcleq_u8(d, width_v[i]));
+        }
+
+        int idx = neon_first_match(mask);
+        if (idx != 16) {
+            buf += idx;
+            *found = 1;
+            return buf;
         }
         buf += 16;
     }
@@ -205,12 +237,7 @@ static const char *findchar_fast(const char *buf, const char *buf_end, const cha
 #if defined(PICOHTTPPARSER_USE_SSE42)
     return findchar_fast_sse42(buf, buf_end, ranges, ranges_size, found);
 #elif defined(PICOHTTPPARSER_USE_NEON)
-    /* NEON matches each range separately. For the 8-range token set used by
-     * parse_token(), this is slower than the scalar token_char_map loop, so
-     * restrict NEON to the smaller path/value range sets (4 or 6 bytes). */
-    if (ranges_size <= 6)
-        return findchar_fast_neon(buf, buf_end, ranges, ranges_size, found);
-    return buf;
+    return findchar_fast_neon(buf, buf_end, ranges, ranges_size, found);
 #else
     /* suppress unused parameter warning */
     (void)buf_end;
