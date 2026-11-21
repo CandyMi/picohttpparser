@@ -27,12 +27,28 @@
 #include <assert.h>
 #include <stddef.h>
 #include <string.h>
-#ifdef __SSE4_2__
+
+/* To force the scalar fallback on AArch64, compile with
+ * -DPICOHTTPPARSER_NO_NEON or uncomment the line below. */
+/* #define PICOHTTPPARSER_NO_NEON 1 */
+
+/* SIMD backend selection. Use project-owned macros instead of defining
+ * compiler-reserved ones (__SSE4_2__, etc.), which could affect feature
+ * checks in subsequently included headers. Define PICOHTTPPARSER_NO_NEON
+ * to force the scalar fallback. */
+#if defined(__SSE4_2__) || defined(__AVX__)
+#define PICOHTTPPARSER_USE_SSE42 1
 #ifdef _MSC_VER
 #include <nmmintrin.h>
 #else
 #include <x86intrin.h>
 #endif
+#elif defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__)) \
+    && !defined(PICOHTTPPARSER_NO_NEON)
+/* vmaxvq_u8 is an AArch64 instruction and is not available on ARMv7 NEON,
+ * so restrict this path to __aarch64__. */
+#define PICOHTTPPARSER_USE_NEON 1
+#include <arm_neon.h>
 #endif
 #include "picohttpparser.h"
 
@@ -110,17 +126,18 @@ static const char *token_char_map = "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\
                                     "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
                                     "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
-static const char *findchar_fast(const char *buf, const char *buf_end, const char *ranges, size_t ranges_size, int *found)
+#ifdef PICOHTTPPARSER_USE_SSE42
+static const char *findchar_fast_sse42(const char *buf, const char *buf_end, 
+                                        const char *ranges, size_t ranges_size, int *found)
 {
     *found = 0;
-#if __SSE4_2__
     if (likely(buf_end - buf >= 16)) {
         __m128i ranges16 = _mm_loadu_si128((const __m128i *)ranges);
-
         size_t left = (buf_end - buf) & ~15;
         do {
             __m128i b16 = _mm_loadu_si128((const __m128i *)buf);
-            int r = _mm_cmpestri(ranges16, ranges_size, b16, 16, _SIDD_LEAST_SIGNIFICANT | _SIDD_CMP_RANGES | _SIDD_UBYTE_OPS);
+            int r = _mm_cmpestri(ranges16, ranges_size, b16, 16,
+                                 _SIDD_LEAST_SIGNIFICANT | _SIDD_CMP_RANGES | _SIDD_UBYTE_OPS);
             if (unlikely(r != 16)) {
                 buf += r;
                 *found = 1;
@@ -130,6 +147,68 @@ static const char *findchar_fast(const char *buf, const char *buf_end, const cha
             left -= 16;
         } while (likely(left != 0));
     }
+    return buf;
+}
+#endif
+
+#ifdef PICOHTTPPARSER_USE_NEON
+static const char *findchar_fast_neon(const char *buf, const char *buf_end, 
+                                       const char *ranges, size_t ranges_size, int *found)
+{
+    *found = 0;
+    if (buf_end - buf < 16)
+        return buf;
+
+    /* ranges is a sequence of [lo, hi] pairs. pico callers only pass even
+     * lengths (4/6/16); the odd-length branch is defensive only and treats
+     * the last pair as a single-byte range. */
+    size_t num_pairs = (ranges_size + 1) / 2;
+
+    while (buf_end - buf >= 16) {
+        uint8x16_t v = vld1q_u8((const uint8_t *)buf);
+        uint8x16_t mask = vdupq_n_u8(0);
+
+        for (size_t i = 0; i < num_pairs; i++) {
+            uint8_t lo = (uint8_t)ranges[i * 2];
+            /* With an odd ranges_size the last pair has no hi; match one byte. */
+            uint8_t hi = (i * 2 + 1 < ranges_size) ? (uint8_t)ranges[i * 2 + 1] : lo;
+
+            /* SSE4.2 _SIDD_CMP_RANGES: lo > hi is an empty range (matches nothing). */
+            if (lo > hi)
+                continue;
+
+            uint8x16_t ge_lo = vcgeq_u8(v, vdupq_n_u8(lo));
+            uint8x16_t le_hi = vcleq_u8(v, vdupq_n_u8(hi));
+            mask = vorrq_u8(mask, vandq_u8(ge_lo, le_hi));
+        }
+
+        /* Fast path: check whether any byte matched. */
+        if (vmaxvq_u8(mask) != 0) {
+            /* Scalar fallback: locate the first matching byte. */
+            uint8_t m[16];
+            vst1q_u8(m, mask);
+            for (int i = 0; i < 16; i++) {
+                if (m[i]) {
+                    buf += i;
+                    *found = 1;
+                    return buf;
+                }
+            }
+        }
+        buf += 16;
+    }
+
+    return buf;
+}
+#endif
+
+static const char *findchar_fast(const char *buf, const char *buf_end, const char *ranges, size_t ranges_size, int *found)
+{
+    *found = 0;
+#if defined(PICOHTTPPARSER_USE_SSE42)
+    return findchar_fast_sse42(buf, buf_end, ranges, ranges_size, found);
+#elif defined(PICOHTTPPARSER_USE_NEON)
+    return findchar_fast_neon(buf, buf_end, ranges, ranges_size, found);
 #else
     /* suppress unused parameter warning */
     (void)buf_end;
@@ -143,7 +222,7 @@ static const char *get_token_to_eol(const char *buf, const char *buf_end, const 
 {
     const char *token_start = buf;
 
-#ifdef __SSE4_2__
+#if defined(PICOHTTPPARSER_USE_SSE42) || defined(PICOHTTPPARSER_USE_NEON)
     static const char ALIGNED(16) ranges1[16] = "\0\010"    /* allow HT */
                                                 "\012\037"  /* allow SP and up to but not including DEL */
                                                 "\177\177"; /* allow chars w. MSB set */
@@ -238,6 +317,9 @@ static const char *is_complete(const char *buf, const char *buf_end, size_t last
     }                                                                                                                              \
     *(valp_) = (mul_) * (*buf++ - '0');
 
+/* RFC 7231: the first digit of status-code must be 1-5 (100..599).
+ * Upstream picohttpparser validates 0-9 only (000..999); this tightening is
+ * intentional. See tests/http_parser_test.lua for the boundary cases. */
 #define PARSE_INT_3(valp_)                                                                                                         \
     do {                                                                                                                           \
         int res_ = 0;                                                                                                              \
