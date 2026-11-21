@@ -208,7 +208,11 @@ static const char *findchar_fast(const char *buf, const char *buf_end, const cha
 #if defined(PICOHTTPPARSER_USE_SSE42)
     return findchar_fast_sse42(buf, buf_end, ranges, ranges_size, found);
 #elif defined(PICOHTTPPARSER_USE_NEON)
-    return findchar_fast_neon(buf, buf_end, ranges, ranges_size, found);
+    /* NEON matches each range separately. For the 8-range token set used by
+        * parse_token(), this is slower than the scalar token_char_map loop, so
+        * restrict NEON to the smaller path/value range sets (4 or 6 bytes). */
+    if (ranges_size <= 6)
+        return findchar_fast_neon(buf, buf_end, ranges, ranges_size, found);
 #else
     /* suppress unused parameter warning */
     (void)buf_end;
