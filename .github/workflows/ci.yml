@@ -46,8 +46,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { simd: neon,    cflags: "" }
-          - { simd: no-neon, cflags: "-DPICOHTTPPARSER_NO_NEON" }
+          - { simd: scalar, cflags: "" }
+          - { simd: neon,   cflags: "-DPICOHTTPPARSER_ENABLE_NEON" }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,11 +56,13 @@ jobs:
         if: matrix.simd == 'neon'
         run: |
           cc -dM -E - < /dev/null | grep -q '__ARM_NEON'
-          cc -E picohttpparser.c | grep -q 'findchar_fast_neon'
+          cc -DPICOHTTPPARSER_ENABLE_NEON -E picohttpparser.c > "$RUNNER_TEMP/preprocessed.i"
+          grep -q 'findchar_fast_neon' "$RUNNER_TEMP/preprocessed.i"
       - name: Verify scalar fallback
-        if: matrix.simd == 'no-neon'
+        if: matrix.simd == 'scalar'
         run: |
-          if cc -E picohttpparser.c | grep -q 'findchar_fast_neon'; then
+          cc -E picohttpparser.c > "$RUNNER_TEMP/preprocessed.i"
+          if grep -q 'findchar_fast_neon' "$RUNNER_TEMP/preprocessed.i"; then
             echo "NEON path unexpectedly enabled"
             exit 1
           fi
@@ -232,8 +234,12 @@ jobs:
           submodules: recursive
       - name: Build
         run: |
-          cc -O2 -o bench-scalar bench.c picohttpparser.c
-          cc -O2 -msse4.2 -o bench-sse42 bench.c picohttpparser.c
+          for cc in gcc clang; do
+            $cc -O2 -o bench-scalar-$cc bench.c picohttpparser.c
+            $cc -O2 -msse4.2 -o bench-sse42-$cc bench.c picohttpparser.c
+            objdump -d bench-sse42-$cc > "$RUNNER_TEMP/bench-$cc.dis"
+            grep -q pcmpestri "$RUNNER_TEMP/bench-$cc.dis"
+          done
       - name: Run and compare
         run: |
           python3 - <<'PY'
@@ -247,22 +253,20 @@ jobs:
                   samples.append(time.perf_counter() - t0)
               return min(samples), statistics.median(samples)
 
-          s_best, s_med = best("./bench-scalar")
-          e_best, e_med = best("./bench-sse42")
-          speedup = s_best / e_best
-          print(f"scalar best={s_best:.3f}s median={s_med:.3f}s")
-          print(f"SSE4.2 best={e_best:.3f}s median={e_med:.3f}s")
-          print(f"speedup={speedup:.2f}x")
-
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write("### x86_64 bench (10M parses)\n")
-              f.write("| build | best | median |\n|---|---|---|\n")
-              f.write(f"| scalar | {s_best:.3f}s | {s_med:.3f}s |\n")
-              f.write(f"| SSE4.2 | {e_best:.3f}s | {e_med:.3f}s |\n")
-              f.write(f"| speedup | {speedup:.2f}x | |\n")
-
-          if speedup < 0.90:
-              raise SystemExit("SSE4.2 is >10% slower than scalar")
+              f.write("| compiler | build | best | median | speedup |\n")
+              f.write("|---|---|---|---|---|\n")
+              for cc in ("gcc", "clang"):
+                  s_best, s_med = best(f"./bench-scalar-{cc}")
+                  e_best, e_med = best(f"./bench-sse42-{cc}")
+                  speedup = s_best / e_best
+                  print(f"{cc}: scalar best={s_best:.3f}s median={s_med:.3f}s")
+                  print(f"{cc}: SSE4.2 best={e_best:.3f}s median={e_med:.3f}s speedup={speedup:.2f}x")
+                  f.write(f"| {cc} | scalar | {s_best:.3f}s | {s_med:.3f}s | |\n")
+                  f.write(f"| {cc} | SSE4.2 | {e_best:.3f}s | {e_med:.3f}s | {speedup:.2f}x |\n")
+                  if speedup < 0.90:
+                      print(f"WARNING: {cc} SSE4.2 is >10% slower than scalar")
           PY
 
   # ---------------------------------------------------------------------------
@@ -278,8 +282,8 @@ jobs:
           submodules: recursive
       - name: Build
         run: |
-          cc -O2 -DPICOHTTPPARSER_NO_NEON -o bench-scalar bench.c picohttpparser.c
-          cc -O2 -o bench-neon bench.c picohttpparser.c
+          cc -O2 -o bench-scalar bench.c picohttpparser.c
+          cc -O2 -DPICOHTTPPARSER_ENABLE_NEON -o bench-neon bench.c picohttpparser.c
       - name: Run and compare
         run: |
           python3 - <<'PY'

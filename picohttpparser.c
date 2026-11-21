@@ -28,14 +28,9 @@
 #include <stddef.h>
 #include <string.h>
 
-/* To force the scalar fallback on AArch64, compile with
- * -DPICOHTTPPARSER_NO_NEON or uncomment the line below. */
-/* #define PICOHTTPPARSER_NO_NEON 1 */
-
 /* SIMD backend selection. Use project-owned macros instead of defining
  * compiler-reserved ones (__SSE4_2__, etc.), which could affect feature
- * checks in subsequently included headers. Define PICOHTTPPARSER_NO_NEON
- * to force the scalar fallback. */
+ * checks in subsequently included headers. */
 #if defined(__SSE4_2__) || defined(__AVX__)
 #define PICOHTTPPARSER_USE_SSE42 1
 #ifdef _MSC_VER
@@ -43,9 +38,11 @@
 #else
 #include <x86intrin.h>
 #endif
-#elif defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__)) \
-    && !defined(PICOHTTPPARSER_NO_NEON)
-/* vmaxvq_u8 is an AArch64 instruction and is not available on ARMv7 NEON,
+#elif defined(__aarch64__) && defined(PICOHTTPPARSER_ENABLE_NEON) \
+    && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+/* NEON is opt-in: the current range scan is slower than the scalar path on
+ * AArch64. Define PICOHTTPPARSER_ENABLE_NEON to enable it.
+ * vmaxvq_u8 is an AArch64 instruction and is not available on ARMv7 NEON,
  * so restrict this path to __aarch64__. */
 #define PICOHTTPPARSER_USE_NEON 1
 #include <arm_neon.h>
@@ -209,10 +206,11 @@ static const char *findchar_fast(const char *buf, const char *buf_end, const cha
     return findchar_fast_sse42(buf, buf_end, ranges, ranges_size, found);
 #elif defined(PICOHTTPPARSER_USE_NEON)
     /* NEON matches each range separately. For the 8-range token set used by
-        * parse_token(), this is slower than the scalar token_char_map loop, so
-        * restrict NEON to the smaller path/value range sets (4 or 6 bytes). */
+     * parse_token(), this is slower than the scalar token_char_map loop, so
+     * restrict NEON to the smaller path/value range sets (4 or 6 bytes). */
     if (ranges_size <= 6)
         return findchar_fast_neon(buf, buf_end, ranges, ranges_size, found);
+    return buf;
 #else
     /* suppress unused parameter warning */
     (void)buf_end;
